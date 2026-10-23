@@ -1,0 +1,6 @@
+.env
+output/
+__pycache__/
+*.sqlite3
+.git/
+config.json

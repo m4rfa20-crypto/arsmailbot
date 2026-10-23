@@ -1,0 +1,7 @@
+{
+  "sender": "approver@example.com",
+  "mailbox": "INBOX",
+  "project_mailbox": false,
+  "amount_cells": {},
+  "disk_folders": {}
+}
