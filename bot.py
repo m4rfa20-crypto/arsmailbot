@@ -15,6 +15,8 @@ from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
+import time
 
 import http_client as requests
 from openpyxl import load_workbook
@@ -73,7 +75,7 @@ def amount(data, filename, rule):
         wb.close()
 
 
-def scan(raw_messages, cfg, start, end, output):
+def scan(raw_messages, cfg, start, end, output, attachment_data=None):
     rows, review, hashes = [], [], set()
     messages = [BytesParser(policy=policy.default).parsebytes(raw) for raw in raw_messages]
     index = index_messages(messages)
@@ -95,7 +97,11 @@ def scan(raw_messages, cfg, start, end, output):
         if not cfg.get('project_mailbox') and not re.search(r'\bнов[ьи]\b', subject + '\n' + text, re.I):
             continue
         if not approved(text):
-            review.append({'reason': 'Нет однозначного согласования', 'subject': subject})
+            review.append({'reason': 'Нет однозначного согласования', 'subject': subject,
+                           'message_id': str(msg.get('Message-ID', '')),
+                           'reply_text': text[:8000], 'reply_text_truncated': len(text) > 8000,
+                           'attachment_names': [p.get_filename() for p in msg.iter_attachments()
+                                                if p.get_filename()]})
             continue
         attachments = [p for p in msg.iter_attachments() if p.get_filename()]
         source = msg
@@ -133,12 +139,11 @@ def scan(raw_messages, cfg, start, end, output):
                 total = amount(data, name, cfg.get('amount_cells', {}).get(key))
             except Exception:
                 total = None
-            local = output / 'attachments' / sha / name
-            local.parent.mkdir(parents=True, exist_ok=True)
-            local.write_bytes(data)
+            if attachment_data is not None:
+                attachment_data[sha] = data
             mid = str(msg.get('Message-ID', ''))
             rows.append(dict(kind=kind, number=number, amount=total, sha256=sha, file=name,
-                             local=str(local), subject=subject, date=str(day), message_id=mid,
+                             size=len(data), subject=subject, date=str(day), message_id=mid,
                              attachment_source_message_id=str(source.get('Message-ID', '')),
                              attachment_source_sender=parseaddr(str(source.get('From', '')))[1],
                              attachment_source_subject=str(source.get('Subject', '')),
@@ -195,7 +200,17 @@ def imap_messages(cfg, start, end):
         yield from parents
 
 
-def disk_upload(row):
+def disk_upload(row, data):
+    """Upload bytes from memory; never write attachments to local storage."""
+    if hashlib.sha256(data).hexdigest() != row['sha256']:
+        raise RuntimeError('Attachment hash mismatch')
+    if row['file'] in ('', '.', '..') or '/' in row['file'] or '\\' in row['file']:
+        raise RuntimeError('Invalid attachment filename')
+    expected_md5 = hashlib.md5(data).hexdigest()
+    def same_file(meta):
+        return (meta.get('type') == 'file' and meta.get('size') == len(data) and
+                (meta.get('sha256') == row['sha256'] if meta.get('sha256') else
+                 meta.get('md5') == expected_md5))
     base = 'https://cloud-api.yandex.net/v1/disk/resources'
     headers = {'Authorization': 'OAuth ' + os.environ['YANDEX_DISK_TOKEN']}
     # Only configured, existing destinations. Never infer folder numbering conventions.
@@ -203,32 +218,46 @@ def disk_upload(row):
     params = {'path': path}
     r = requests.get(base, headers=headers, params=params, timeout=45)
     if r.status_code == 200:
-        expected = hashlib.md5(Path(row['local']).read_bytes()).hexdigest()
-        if r.json().get('md5') != expected:
+        if not same_file(r.json()):
             raise RuntimeError('На Диске уже есть другая версия: ' + row['file'])
     elif r.status_code == 404:
         r = requests.get(base + '/upload', headers=headers,
                          params={**params, 'overwrite': 'false'}, timeout=45)
         r.raise_for_status()
-        with open(row['local'], 'rb') as f:
-            uploaded = requests.put(r.json()['href'], data=f, timeout=120)
+        link = r.json()
+        url = urlsplit(link['href'])
+        hostname = url.hostname or ''
+        if (url.scheme != 'https' or url.username or url.password or url.port not in (None, 443)
+                or not hostname.endswith(('.disk.yandex.net', '.disk.yandex.ru'))
+                or link.get('method', 'PUT') != 'PUT'):
+            raise RuntimeError('Unexpected Disk upload endpoint')
+        uploaded = requests.put(link['href'], data=data, timeout=120, allow_redirects=False)
         uploaded.raise_for_status()
-        check = requests.get(base, headers=headers, params=params, timeout=45)
-        check.raise_for_status()
-        if check.json().get('md5') != hashlib.md5(Path(row['local']).read_bytes()).hexdigest():
-            raise RuntimeError('Загрузка пока не подтверждена; повторите проверку')
+        if uploaded.status_code not in (201, 202):
+            raise RuntimeError('Unexpected upload status')
+        for attempt in range(3):
+            check = requests.get(base, headers=headers, params=params, timeout=45)
+            if check.status_code == 200 and same_file(check.json()):
+                break
+            if check.status_code not in (200, 404):
+                check.raise_for_status()
+            if attempt == 2:
+                raise RuntimeError('Загрузка пока не подтверждена; повторите проверку')
+            time.sleep(2)
     else:
         r.raise_for_status()
     return 'https://disk.yandex.ru/client/disk' + quote('/' + path.removeprefix('disk:/').lstrip('/'))
 
 
-def publish(report, dbpath, upload=True):
+def publish(report, dbpath, upload=True, attachment_data=None):
     db = sqlite3.connect(dbpath)
     db.execute('CREATE TABLE IF NOT EXISTS deliveries (key TEXT PRIMARY KEY, status TEXT)')
     for row in report['documents']:
         if not upload or row['conflict'] or not row['disk_folder']:
             continue
-        row['disk_link'] = disk_upload(row)
+        if attachment_data is None or row['sha256'] not in attachment_data:
+            raise RuntimeError('Attachment bytes unavailable; rescan required')
+        row['disk_link'] = disk_upload(row, attachment_data[row['sha256']])
     content = render(report)
     # Stable report key, excludes local paths. Pending delivery is never automatically retried.
     key = hashlib.sha256(content.encode()).hexdigest()
@@ -271,11 +300,14 @@ def main():
     cfg = json.loads(os.environ['BOT_CONFIG_JSON']) if os.getenv('BOT_CONFIG_JSON') else json.loads(Path(a.config).read_text())
     a.output.mkdir(parents=True, exist_ok=True)
     messages = (f.read_bytes() for f in sorted(a.eml_dir.glob('*.eml'))) if a.eml_dir else imap_messages(cfg, a.start, a.end)
-    report = scan(messages, cfg, a.start, a.end, a.output)
+    attachment_data = {} if a.publish and not a.no_disk else None
+    report = scan(messages, cfg, a.start, a.end, a.output, attachment_data=attachment_data)
     if a.publish:
-        publish(report, a.output / 'state.sqlite3', upload=not a.no_disk)
-    (a.output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
-    (a.output / 'report.txt').write_text(render(report))
+        publish(report, a.output / 'state.sqlite3', upload=not a.no_disk, attachment_data=attachment_data)
+    if attachment_data is not None:
+        attachment_data.clear()
+    (a.output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    (a.output / 'report.txt').write_text(render(report), encoding='utf-8')
     print('Отчёт готов: ' + str(a.output / 'report.txt'))
 
 
