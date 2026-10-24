@@ -5,4 +5,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 COPY config.example.json ./
 ENV PYTHONUNBUFFERED=1
-CMD ["python", "worker.py"]
+CMD ["python", "cloud_entry.py"]
